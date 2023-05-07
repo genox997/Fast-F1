@@ -23,19 +23,22 @@ When rate limits are exceeded, FastF1 will either...
 import collections
 import datetime
 import functools
+import lzma
 import math
 import os
-import re
 import pickle
+import re
 import sys
 import time
 from typing import Optional
 
+import boto3
 import requests
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 from requests_cache import CacheMixin
 
 from fastf1.logger import get_logger
-
 
 _logger = get_logger(__name__)
 
@@ -62,6 +65,92 @@ _logger = get_logger(__name__)
 # from accessing a specific API. This has happened before and just causes
 # unnecessary hassle for many people.
 
+class _Database:
+
+    def __init__(self, table_name):
+        try:
+            id, aws_key, region = os.environ['ACCESS_KEY_ID'], os.environ['SECRET_ACCESS_KEY'], os.environ['REGION']
+        except TypeError:
+            _logger.error("Error: Cannot read AWS credentials from environment")
+            exit()
+
+        """Initialize db class variables"""
+        self.resource = boto3.resource('dynamodb', aws_access_key_id=id,
+                                       aws_secret_access_key=aws_key,
+                                       region_name=region)
+        self.table = None
+        self.exists(table_name)
+
+    def exists(self, table_name):
+        """
+        Determines whether a table exists. As a side effect, stores the table in
+        a member variable.
+        :param table_name: The name of the table to check.
+        :return: True when the table exists; otherwise, False.
+        """
+        try:
+            table = self.resource.Table(table_name)
+            table.load()
+            exists = True
+            _logger.info(
+                f"Table {table_name} found")
+        except ClientError as err:
+            if err.response['Error']['Code'] == 'ResourceNotFoundException':
+                exists = False
+            else:
+                _logger.error(
+                    f"Couldn't check for existence of {table_name}. Here's why: {err.response['Error']['Code']}: {err.response['Error']['Message']}")
+                raise
+        else:
+            self.table = table
+        return exists
+
+    def write_data_to_db(self, cache_key, data):
+
+        pickled_data = lzma.compress(pickle.dumps(data))
+        num_chunks = math.ceil(len(pickled_data) / 400000)  # Split data into chunks of 400KB or less
+        try:
+            for i in range(num_chunks):
+                chunk_data = pickled_data[i * 400000:(i + 1) * 400000]
+                chunk_key = f"{cache_key}_{i + 1}"  # Append chunk index to the cache_key
+                self.table.put_item(
+                    Item={
+                        'cache_key': chunk_key,
+                        'data': chunk_data,
+                    }
+                )
+            return True
+
+        except ClientError as err:
+            _logger.error(f"Database ERROR - {cache_key} - dimension {sys.getsizeof(pickle.dumps(data))} - {err}")
+            return False
+
+    def get_data_from_db(self, cache_key):
+        try:
+            # Scan the table for all items with cache_keys that start with the given cache_key
+            response = self.table.scan(
+                FilterExpression=Key('cache_key').begins_with(cache_key)
+            )
+            if 'Item' in response:
+                data = b''
+                for i in range(len(response['Item']['data_parts'])):
+                    part = response['Item']['data_parts'][i]['data']
+                    data += bytes(part)
+                return pickle.loads(lzma.decompress(data))
+
+            else:
+                return None
+        except ClientError as err:
+            _logger.error(
+                f"Couldn't retrieve data from cache key {cache_key}. Here's why: {err.response['Error']['Code']}: {err.response['Error']['Message']}")
+            return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, ext_type, exc_value, traceback):
+        pass
+
 
 class _MinIntervalLimitDelay:
     """Ensure that there is at least a minimum delay between each request.
@@ -69,6 +158,7 @@ class _MinIntervalLimitDelay:
     Sleeps for the remaining amount of time if the last request was more recent
     than allowed by the minimum interval rule.
     """
+
     def __init__(self, interval: float):
         self._interval: float = interval
         self._t_last: float = 0.0
@@ -87,6 +177,7 @@ class _CallsPerIntervalLimitRaise:
     If the maximum number of allowed requests within this interval is exceeded,
     a :class:`RateLimitExceeded` exception is raised.
     """
+
     def __init__(self, calls: int, interval: float, info: str):
         self._interval: float = interval
         self._timestamps = collections.deque(maxlen=calls)
@@ -107,7 +198,7 @@ class _SessionWithRateLimiting(requests.Session):
         re.compile(r"^https?://(\w+\.)?ergast\.com.*"): [
             _MinIntervalLimitDelay(0.25),
             # soft limit 4 calls/sec
-            _CallsPerIntervalLimitRaise(200, 60*60, "ergast.com: 200 calls/h")
+            _CallsPerIntervalLimitRaise(200, 60 * 60, "ergast.com: 200 calls/h")
             # hard limit 200 calls/h
         ]
     }
@@ -196,6 +287,8 @@ class Cache:
     this also means you will have to redownload the same data again if you
     need which will lead to reduced performance.
     """
+    _DB = None
+    _TABLE_NAME = None
     _CACHE_DIR = None
     # version of the api parser code (unrelated to release version number)
     _API_CORE_VERSION = 9
@@ -212,7 +305,8 @@ class Cache:
     def enable_cache(
             cls, cache_dir: str, ignore_version: bool = False,
             force_renew: bool = False,
-            use_requests_cache: bool = True):
+            use_requests_cache: bool = True,
+            table_name: str = None):
         """Enables the API cache.
 
         Args:
@@ -225,31 +319,43 @@ class Cache:
             force_renew: Ignore existing cached data. Download data and update
                 the cache instead.
             use_requests_cache: Do caching of the raw GET and POST requests.
+            table_name: Name of the DynamoDB which should be used to store
+                cached data. Table needs to exist.
         """
-        # Allow users to use paths such as %LOCALAPPDATA%
-        cache_dir = os.path.expandvars(cache_dir)
+        # If table_name is set then cache will be stored on DynamoDB table
 
-        # Allow users to use paths such as ~user or ~/
-        cache_dir = os.path.expanduser(cache_dir)
+        if table_name:
+            cls._TABLE_NAME = table_name
+            cls._CACHE_DIR = None
+            cls._IGNORE_VERSION = ignore_version
+            cls._FORCE_RENEW = force_renew
+            cls._DB = _Database(table_name)
+        else:
+            # Allow users to use paths such as %LOCALAPPDATA%
+            cache_dir = os.path.expandvars(cache_dir)
 
-        if not os.path.exists(cache_dir):
-            raise NotADirectoryError("Cache directory does not exist! Please "
-                                     "check for typos or create it first.")
-        cls._CACHE_DIR = cache_dir
-        cls._IGNORE_VERSION = ignore_version
-        cls._FORCE_RENEW = force_renew
-        if use_requests_cache:
-            cls._requests_session_cached = _CachedSessionWithRateLimiting(
-                cache_name=os.path.join(cache_dir, 'fastf1_http_cache'),
-                backend='sqlite',
-                allowable_methods=('GET', 'POST'),
-                expire_after=datetime.timedelta(hours=12),
-                cache_control=True,
-                stale_if_error=True,
-                filter_fn=cls._custom_cache_filter
-            )
-            if force_renew:
-                cls._requests_session_cached.cache.clear()
+            # Allow users to use paths such as ~user or ~/
+            cache_dir = os.path.expanduser(cache_dir)
+
+            if not os.path.exists(cache_dir):
+                raise NotADirectoryError("Cache directory does not exist! Please "
+                                         "check for typos or create it first.")
+            cls._CACHE_DIR = cache_dir
+            cls._TABLE_NAME = None
+            cls._IGNORE_VERSION = ignore_version
+            cls._FORCE_RENEW = force_renew
+            if use_requests_cache:
+                cls._requests_session_cached = _CachedSessionWithRateLimiting(
+                    cache_name=os.path.join(cache_dir, 'fastf1_http_cache'),
+                    backend='sqlite',
+                    allowable_methods=('GET', 'POST'),
+                    expire_after=datetime.timedelta(hours=12),
+                    cache_control=True,
+                    stale_if_error=True,
+                    filter_fn=cls._custom_cache_filter
+                )
+                if force_renew:
+                    cls._requests_session_cached.cache.clear()
 
     @classmethod
     def requests_get(cls, *args, **kwargs):
@@ -430,6 +536,46 @@ class Cache:
                     _logger.critical("Failed to load data!")
                     exit()
 
+            elif cls._TABLE_NAME and not cls._tmp_disabled:
+
+                # caching is enabled
+                func_name = str(func.__name__)
+                cache_file_path = cls._get_cache_file_path(api_path, func_name)
+
+                if cls._ci_mode:
+                    # skip pickle cache in ci mode so that API parser code
+                    # is always executed. Only http cache is active
+                    return func(api_path, **func_kwargs)
+
+                cached = cls._DB.get_data_from_db(cache_file_path)
+
+                if (cached is not None) and cls._data_ok_for_use(cached):
+                    _logger.info(f"1")
+
+                    # cached data is ok for use, return it
+                    _logger.info(f"Using cached data for {func_name}")
+                    return cached['data']
+                else:
+                    _logger.info(f"2")
+
+                    # cached data needs to be downloaded again and updated
+                    _logger.info(f"Updating cache for {func_name}...")
+                    data = func(api_path, **func_kwargs)
+
+                    if data is not None:
+                        cls._write_cache(data, cache_file_path)
+                        _logger.info("Cache updated!")
+                        return data
+
+                    _logger.critical(
+                        "A cache update is required but the data failed "
+                        "to download. Cannot continue!\nYou may force to "
+                        "ignore a cache version mismatch by using the "
+                        "`ignore_version=True` keyword when enabling the "
+                        "cache (not recommended)."
+                    )
+                    exit()
+
             else:  # cache was not enabled
                 if not cls._tmp_disabled:
                     cls._enable_default_cache()
@@ -441,13 +587,18 @@ class Cache:
     def _get_cache_file_path(cls, api_path, name):
         # extend the cache dir path using the api path and a file name
         # leading '/static/' is dropped form api path
-        cache_dir_path = os.path.join(cls._CACHE_DIR, api_path[8:])
-        if not os.path.exists(cache_dir_path):
-            # create subfolders if they don't yet exist
-            os.makedirs(cache_dir_path)
+        if cls._TABLE_NAME:
+            cache_file_path = (api_path[13:] + name).replace('/', '-')
+        else:
 
-        file_name = name + '.ff1pkl'
-        cache_file_path = os.path.join(cache_dir_path, file_name)
+            cache_dir_path = os.path.join(cls._CACHE_DIR, api_path[8:])
+            if not os.path.exists(cache_dir_path):
+                # create subfolders if they don't yet exist
+                os.makedirs(cache_dir_path)
+
+            file_name = name + '.ff1pkl'
+            cache_file_path = os.path.join(cache_dir_path, file_name)
+
         return cache_file_path
 
     @classmethod
@@ -467,8 +618,11 @@ class Cache:
             **{'version': cls._API_CORE_VERSION, 'data': data},
             **kwargs
         )
-        with open(cache_file_path, 'wb') as cache_file_obj:
-            pickle.dump(new_cached, cache_file_obj)
+        if cls._TABLE_NAME:
+            cls._DB.write_data_to_db(cache_file_path, data)
+        else:
+            with open(cache_file_path, 'wb') as cache_file_obj:
+                pickle.dump(new_cached, cache_file_obj)
 
     @classmethod
     def get_default_cache_path(cls):
@@ -488,7 +642,7 @@ class Cache:
 
     @classmethod
     def _enable_default_cache(cls):
-        if not cls._CACHE_DIR and not cls._default_cache_enabled:
+        if not cls._CACHE_DIR and not cls._TABLE_NAME and not cls._default_cache_enabled:
             cache_dir = None
             if "FASTF1_CACHE" in os.environ:
                 cache_dir = os.environ.get("FASTF1_CACHE")
@@ -611,7 +765,8 @@ class Cache:
         cls._ci_mode = enabled
 
     @classmethod
-    def _convert_size(cls, size_bytes):  # https://stackoverflow.com/questions/5194057/better-way-to-convert-file-sizes-in-python # noqa: E501
+    def _convert_size(cls,
+                      size_bytes):  # https://stackoverflow.com/questions/5194057/better-way-to-convert-file-sizes-in-python # noqa: E501
         if size_bytes == 0:
             return "0B"
         size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
@@ -621,7 +776,8 @@ class Cache:
         return "%s %s" % (s, size_name[i])
 
     @classmethod
-    def _get_size(cls, start_path='.'):  # https://stackoverflow.com/questions/1392413/calculating-a-directorys-size-using-python # noqa: E501
+    def _get_size(cls,
+                  start_path='.'):  # https://stackoverflow.com/questions/1392413/calculating-a-directorys-size-using-python # noqa: E501
         total_size = 0
         for dirpath, dirnames, filenames in os.walk(start_path):
             for f in filenames:
