@@ -31,7 +31,7 @@ import re
 import sys
 import time
 from typing import Optional
-
+from boto3.dynamodb.types import Binary
 import boto3
 import requests
 from boto3.dynamodb.conditions import Key
@@ -106,38 +106,49 @@ class _Database:
         return exists
 
     def write_data_to_db(self, cache_key, data):
-
         pickled_data = lzma.compress(pickle.dumps(data))
-        num_chunks = math.ceil(len(pickled_data) / 400000)  # Split data into chunks of 400KB or less
-        try:
-            for i in range(num_chunks):
-                chunk_data = pickled_data[i * 400000:(i + 1) * 400000]
-                chunk_key = f"{cache_key}_{i + 1}"  # Append chunk index to the cache_key
-                self.table.put_item(
-                    Item={
-                        'cache_key': chunk_key,
-                        'data': chunk_data,
-                    }
-                )
-            return True
 
-        except ClientError as err:
-            _logger.error(f"Database ERROR - {cache_key} - dimension {sys.getsizeof(pickle.dumps(data))} - {err}")
-            return False
+        num_chunks = math.ceil(len(pickled_data) / 399000)  # Split data into chunks of 400KB or less
+        for i in range(num_chunks):
+            chunk_data = pickled_data[i * 399000:(i + 1) * 399000]
+            # Define the initial retry delay and maximum number of retries for each put_item operation
+            retry_delay = 0.1
+            max_retries = 5
+
+            for attempt in range(max_retries):
+                try:
+                    self.table.put_item(
+                        Item={
+                            'cache_key': cache_key,
+                            'part': i + 1,
+                            'data': Binary(chunk_data),
+                        }
+                    )
+                    break  # Exit the retry loop if the put_item operation succeeds
+                except ClientError as err:
+                    if err.response['Error']['Code'] == 'ProvisionedThroughputExceededException':
+                        _logger.warning(f"Database ERROR - {cache_key} - {err}. Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Double the retry delay for the next attempt
+                    else:
+                        _logger.error(f"Database ERROR - {cache_key} - {err}")
 
     def get_data_from_db(self, cache_key):
         try:
-            # Scan the table for all items with cache_keys that start with the given cache_key
-            response = self.table.scan(
-                FilterExpression=Key('cache_key').begins_with(cache_key)
-            )
-            if 'Item' in response:
+            # Scan the table for all items with certain cache_key
+            response = self.table.query(KeyConditionExpression=Key('cache_key').eq(cache_key))
+            if response['Count'] == 0:
+                return None
+            if 'Items' in response:
                 data = b''
-                for i in range(len(response['Item']['data_parts'])):
-                    part = response['Item']['data_parts'][i]['data']
-                    data += bytes(part)
-                return pickle.loads(lzma.decompress(data))
-
+                for i in range(len(response['Items'])):
+                    part = response['Items'][i]['data']
+                    data += (part.value)
+                try:
+                    return {'data': pickle.loads(lzma.decompress(data))}
+                except Exception as e:
+                    _logger.error(e)
+                    return None
             else:
                 return None
         except ClientError as err:
@@ -550,14 +561,10 @@ class Cache:
                 cached = cls._DB.get_data_from_db(cache_file_path)
 
                 if (cached is not None) and cls._data_ok_for_use(cached):
-                    _logger.info(f"1")
-
                     # cached data is ok for use, return it
                     _logger.info(f"Using cached data for {func_name}")
                     return cached['data']
                 else:
-                    _logger.info(f"2")
-
                     # cached data needs to be downloaded again and updated
                     _logger.info(f"Updating cache for {func_name}...")
                     data = func(api_path, **func_kwargs)
